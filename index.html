@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FATmax Studio Pro (Group Edition)</title>
+    
+    <link rel="stylesheet" href="https://pyscript.net/releases/2024.1.1/core.css">
+    <script type="module" src="https://pyscript.net/releases/2024.1.1/core.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@2.1.0/dist/chartjs-plugin-annotation.min.js"></script>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+
+    <style>
+        body { font-family: 'Segoe UI', system-ui, sans-serif; background: #f4f6f8; color: #343a40; padding: 20px; }
+        .container-custom { max-width: 1400px; margin: auto; }
+        .header-card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); margin-bottom: 20px; text-align: center; border-top: 5px solid #d63384; }
+        h1 { color: #d63384; font-weight: 800; }
+        .controls { background: white; padding: 20px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); display: flex; gap: 20px; align-items: center; flex-wrap: wrap; }
+        .chart-card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); margin-bottom: 20px; }
+        .grid-charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(450px, 1fr)); gap: 20px; }
+        .alert-box { background: #f8d7da; color: #842029; padding: 15px; border-radius: 8px; border-left: 5px solid #dc3545; margin-bottom: 20px; display: none; font-weight: bold; }
+        .badge-metric { font-size: 0.85em; padding: 6px 12px; border-radius: 20px; background: #e9ecef; color: #495057; margin-right: 5px; display: inline-block; margin-bottom: 5px; }
+        .badge-poor { background: #f8d7da; color: #842029; }
+        .badge-meas { background: #d1e7dd; color: #0f5132; }
+        #loader { display: none; margin-left: 15px; font-weight: bold; color: #d63384; }
+    </style>
+
+    <py-config>
+        packages = ["pandas", "numpy", "scipy", "openpyxl"]
+    </py-config>
+</head>
+<body>
+
+<div class="container-custom">
+    <div class="header-card">
+        <h1>🔥 FATmax Studio Pro</h1>
+        <p class="text-muted">Dual-Model Cohort Analysis & Kinetic Shape Profiling</p>
+    </div>
+
+    <div class="controls">
+        <input type="file" id="csv_file" class="form-control" accept=".csv" style="max-width: 250px;">
+        
+        <select id="load_metric" class="form-select" style="max-width: 200px;">
+            <option value="Speed (km/h)">Speed (km/h)</option>
+            <option value="Power output (watts)">Power output (watts)</option>
+            <option value="Total work (J)">Total work (J)</option>
+        </select>
+
+        <div class="form-check form-switch">
+            <input class="form-check-input" type="checkbox" id="include_rest" checked>
+            <label class="form-check-label" for="include_rest">Include Rest (Load=0)</label>
+        </div>
+        
+        <button id="run_btn" class="btn btn-primary" style="background-color: #d63384; border-color: #d63384;">Run Group Analysis</button>
+        <a id="download_excel" class="btn btn-success disabled" style="display: none;">📥 Download Excel Report</a>
+        <span id="loader">⚙️ Processing Cohort...</span>
+    </div>
+
+    <div id="alerts_container" class="alert-box">
+        ⚠️ <b>Significant Structural Deviation:</b> <span id="alert_list"></span>. These subjects failed the Wald's Runs Test for randomness (p < 0.05), indicating the SIN model does not accurately represent their true physiological curve.
+    </div>
+
+    <div class="chart-card" id="group_chart_container" style="display: none;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+            <h3 style="color: #495057; margin: 0;">Group Average Curve</h3>
+            <button class="btn btn-sm btn-outline-secondary" onclick="downloadChart('groupChart', 'Cohort_Average_FATmax')">📸 Save Plot</button>
+        </div>
+        <div style="height: 400px;"><canvas id="groupChart"></canvas></div>
+    </div>
+
+    <h3 style="color: #495057; margin-top: 30px; margin-bottom: 15px; display: none;" id="indiv_title">Individual Subject Kinetics</h3>
+    <div class="grid-charts" id="individual_charts_container"></div>
+</div>
+
+<script type="py">
+import js
+from pyodide.ffi import create_proxy
+import pandas as pd
+import numpy as np
+from scipy.optimize import curve_fit, fsolve
+import scipy.stats as stats
+import base64
+import io
+import json
+import math
+
+def safe_float(v):
+    if v is None or pd.isna(v) or math.isnan(v) or math.isinf(v): return None
+    return float(v)
+
+def clean_list(lst):
+    return [safe_float(x) for x in lst]
+
+# Original Cheneviere Model (Math Constraint 0,0)
+def sin_model(x, a, b, c):
+    return a * np.sin(np.pi * x / b) * np.exp(-c * x)
+
+# Biological Resting-In Model (+d Baseline)
+def sin_model_rest(x, a, b, c, d):
+    return a * np.sin(np.pi * x / b) * np.exp(-c * x) + d
+
+def clean_and_impute(y, loads):
+    s = pd.Series(y)
+    valid_mask = s.notna()
+    if valid_mask.sum() < 4: return s.values, 0
+    
+    try:
+        loads_valid = loads[valid_mask.values]
+        s_valid = s[valid_mask].values
+        z = np.polyfit(loads_valid, s_valid, 2)
+        p = np.poly1d(z)
+        trend = pd.Series(p(loads), index=s.index)
+    except:
+        trend = s.rolling(window=3, center=True, min_periods=1).mean()
+        
+    resid = s - trend
+    std_resid = resid.std()
+    
+    outliers = (s < 0)
+    if std_resid > 0.01:
+        outliers = outliers | (np.abs(resid) > 2.5 * std_resid)
+        
+    outlier_count = outliers.sum()
+    s_clean = s.copy()
+    s_clean[outliers] = np.nan
+    s_clean = s_clean.interpolate(method='linear', limit_area='inside')
+    
+    return s_clean.values, int(outlier_count)
+
+def wald_runs_test(y_true, y_pred):
+    residuals = np.array(y_true) - np.array(y_pred)
+    signs = [1 if r > 0 else -1 for r in residuals if r != 0]
+    if not signs: return np.nan, np.nan
+    runs = 1
+    for i in range(1, len(signs)):
+        if signs[i] != signs[i-1]: runs += 1
+    n1, n2 = signs.count(1), signs.count(-1)
+    N = n1 + n2
+    if N < 2: return runs, np.nan
+    expected_runs = ((2 * n1 * n2) / N) + 1
+    variance = (2 * n1 * n2 * (2 * n1 * n2 - N)) / ((N**2) * (N - 1))
+    if variance <= 0: return runs, np.nan
+    z = (runs - expected_runs) / np.sqrt(variance)
+    return runs, 2 * stats.norm.sf(abs(z))
+
+def assess_shape(mfo, fatmax_x, max_load, c):
+    amp = "High" if mfo > 0.6 else "Low" if mfo < 0.35 else "Moderate"
+    trans = "Left Shifted (Early)" if (fatmax_x / max_load) < 0.4 else "Right Shifted (Late)" if (fatmax_x / max_load) > 0.6 else "Central"
+    sym = "Right Skewed" if c > 0.05 else "Left Skewed" if c < -0.05 else "Symmetric"
+    return f"Amp: {amp} | Trans: {trans} | Sym: {sym}"
+
+def calc_ccc(df, col1, col2):
+    s1 = pd.to_numeric(df[col1], errors='coerce')
+    s2 = pd.to_numeric(df[col2], errors='coerce')
+    mask = ~(s1.isna() | s2.isna())
+    if mask.sum() < 2: return "N/A"
+    s1, s2 = s1[mask], s2[mask]
+    mean1, mean2 = s1.mean(), s2.mean()
+    var1, var2 = s1.var(ddof=1), s2.var(ddof=1)
+    cov = np.cov(s1, s2)[0,1]
+    ccc = (2 * cov) / (var1 + var2 + (mean1 - mean2)**2)
+    return round(ccc, 4)
+
+async def process_data(event):
+    js.document.getElementById("loader").style.display = "inline-block"
+    js.document.getElementById("alerts_container").style.display = "none"
+    js.document.getElementById("individual_charts_container").innerHTML = ""
+    js.document.getElementById("indiv_title").style.display = "none"
+    
+    file_input = js.document.getElementById("csv_file")
+    if not file_input.files.length:
+        js.window.alert("Please upload a CSV file.")
+        js.document.getElementById("loader").style.display = "none"
+        return
+
+    include_rest = js.document.getElementById("include_rest").checked
+    load_metric = js.document.getElementById("load_metric").value
+    
+    file = file_input.files.item(0)
+    text = await file.text()
+    
+    df = pd.read_csv(io.StringIO(text))
+    load_col = df.columns[0]
+    
+    if not include_rest:
+        df = df[df[load_col] > 0].reset_index(drop=True)
+        
+    loads = df[load_col].values
+    max_load = np.max(loads)
+    subjects = df.columns[1:]
+    
+    if len(subjects) > 30:
+        subjects = subjects[:30]
+        js.window.alert("Maximum 30 subjects allowed. Extra columns ignored.")
+        
+    results = []
+    poor_fits = []
+    group_curves_orig = []
+    group_curves_rest = []
+    js_data_payload = []
+
+    for subj in subjects:
+        raw_y = df[subj].values
+        y_clean, out_count = clean_and_impute(raw_y, loads)
+        
+        valid_idx = ~pd.isna(y_clean)
+        fit_loads = loads[valid_idx]
+        fit_y = y_clean[valid_idx]
+        n = len(fit_loads)
+        
+        meas_mfo = np.max(fit_y) if n > 0 else None
+        meas_fatmax = fit_loads[np.argmax(fit_y)] if n > 0 else None
+        
+        if n < 4:
+            results.append({"Subject": subj, "Orig Modeled MFO [g/min]": "Error"})
+            continue
+
+        x_smooth = np.linspace(min(loads), max_load, 100)
+        
+        # --- MODEL 1: ORIGINAL (CHENEVIERE) ---
+        bounds_orig = ([0.1, max_load * 0.5, -2], [2.0, max_load * 3.0, 2])
+        p0_orig = [meas_mfo, max_load * 1.5, 0.01]
+        
+        try:
+            popt_o, _ = curve_fit(sin_model, fit_loads, fit_y, p0=p0_orig, bounds=bounds_orig, maxfev=10000)
+            y_smooth_orig = sin_model(x_smooth, *popt_o)
+            group_curves_orig.append(y_smooth_orig)
+            
+            mfo_o = np.max(y_smooth_orig)
+            fatmax_o = x_smooth[np.argmax(y_smooth_orig)]
+            z_idx_o = np.where(y_smooth_orig >= (mfo_o * 0.90))[0]
+            z_lo_o = x_smooth[z_idx_o[0]] if len(z_idx_o) > 0 else fatmax_o
+            z_hi_o = x_smooth[z_idx_o[-1]] if len(z_idx_o) > 0 else fatmax_o
+            
+            try: fmin_o = fsolve(lambda x: sin_model(x, *popt_o), x0=fatmax_o + 1)[0]
+            except: fmin_o = None
+            if fmin_o is not None and (fmin_o < fatmax_o or fmin_o > max_load * 2): fmin_o = None
+                
+            y_pred_o = sin_model(fit_loads, *popt_o)
+            ss_res_o = np.sum((fit_y - y_pred_o)**2)
+            ss_tot_o = np.sum((fit_y - np.mean(fit_y))**2)
+            r2_o = 1 - (ss_res_o / ss_tot_o) if ss_tot_o > 0 else 0
+            runs_count_o, runs_pval_o = wald_runs_test(fit_y, y_pred_o)
+            shape_desc_o = assess_shape(mfo_o, fatmax_o, max_load, popt_o[2])
+            
+            if not np.isnan(runs_pval_o) and runs_pval_o < 0.05: poor_fits.append(subj)
+        except:
+            popt_o = [None, None, None]
+            mfo_o = fatmax_o = z_lo_o = z_hi_o = fmin_o = r2_o = runs_pval_o = None
+            shape_desc_o = "Fit Failed"
+            y_smooth_orig = [None] * len(x_smooth)
+
+        # --- MODEL 2: RESTING IN (+d) ---
+        bounds_rest = ([0.1, max_load * 0.5, -2, 0], [2.0, max_load * 3.0, 2, meas_mfo if meas_mfo else 1.0])
+        p0_rest = [meas_mfo, max_load * 1.5, 0.01, fit_y[0] if fit_loads[0]==0 else 0.05]
+        
+        try:
+            popt_r, _ = curve_fit(sin_model_rest, fit_loads, fit_y, p0=p0_rest, bounds=bounds_rest, maxfev=10000)
+            y_smooth_rest = sin_model_rest(x_smooth, *popt_r)
+            group_curves_rest.append(y_smooth_rest)
+            
+            mfo_r = np.max(y_smooth_rest)
+            fatmax_r = x_smooth[np.argmax(y_smooth_rest)]
+            z_idx_r = np.where(y_smooth_rest >= (mfo_r * 0.90))[0]
+            z_lo_r = x_smooth[z_idx_r[0]] if len(z_idx_r) > 0 else fatmax_r
+            z_hi_r = x_smooth[z_idx_r[-1]] if len(z_idx_r) > 0 else fatmax_r
+            
+            try: fmin_r = fsolve(lambda x: sin_model_rest(x, *popt_r), x0=fatmax_r + 1)[0]
+            except: fmin_r = None
+            if fmin_r is not None and (fmin_r < fatmax_r or fmin_r > max_load * 2): fmin_r = None
+                
+            y_pred_r = sin_model_rest(fit_loads, *popt_r)
+            ss_res_r = np.sum((fit_y - y_pred_r)**2)
+            ss_tot_r = np.sum((fit_y - np.mean(fit_y))**2)
+            r2_r = 1 - (ss_res_r / ss_tot_r) if ss_tot_r > 0 else 0
+            _, runs_pval_r = wald_runs_test(fit_y, y_pred_r)
+        except:
+            popt_r = [None, None, None, None]
+            mfo_r = fatmax_r = z_lo_r = z_hi_r = fmin_r = r2_r = runs_pval_r = None
+            y_smooth_rest = [None] * len(x_smooth)
+
+        # Add to Excel Results
+        results.append({
+            "Subject": subj,
+            "Measured MFO [g/min]": round(meas_mfo, 3) if meas_mfo else "N/A",
+            "Measured FATmax (Load)": round(meas_fatmax, 2) if meas_fatmax else "N/A",
+            
+            "Orig Modeled MFO [g/min]": round(mfo_o, 3) if mfo_o else "Error",
+            "Rest Modeled MFO [g/min]": round(mfo_r, 3) if mfo_r else "Error",
+            "Orig MFO Bias (Mod-Meas)": round(mfo_o - meas_mfo, 3) if mfo_o and meas_mfo else "N/A",
+            "Rest MFO Bias (Mod-Meas)": round(mfo_r - meas_mfo, 3) if mfo_r and meas_mfo else "N/A",
+            
+            "Orig Modeled FATmax (Load)": round(fatmax_o, 2) if fatmax_o else "N/A",
+            "Rest Modeled FATmax (Load)": round(fatmax_r, 2) if fatmax_r else "N/A",
+            
+            "Orig FATmin (Load)": round(fmin_o, 2) if fmin_o else "N/A",
+            "Rest FATmin (Load)": round(fmin_r, 2) if fmin_r else "N/A",
+            
+            "Orig FATmax Zone Low": round(z_lo_o, 2) if z_lo_o else "N/A",
+            "Rest FATmax Zone Low": round(z_lo_r, 2) if z_lo_r else "N/A",
+            "Orig FATmax Zone High": round(z_hi_o, 2) if z_hi_o else "N/A",
+            "Rest FATmax Zone High": round(z_hi_r, 2) if z_hi_r else "N/A",
+            
+            "Orig Translation (b)": round(popt_o[1], 3) if popt_o[1] else "N/A",
+            "Rest Translation (b)": round(popt_r[1], 3) if popt_r[1] else "N/A",
+            "Orig Symmetry (c)": round(popt_o[2], 3) if popt_o[2] else "N/A",
+            "Rest Symmetry (c)": round(popt_r[2], 3) if popt_r[2] else "N/A",
+            "Rest Baseline (d)": round(popt_r[3], 3) if popt_r[3] else "N/A",
+            
+            "Orig R2 (Fit)": round(r2_o, 3) if r2_o else "N/A",
+            "Rest R2 (Fit)": round(r2_r, 3) if r2_r else "N/A",
+            "Orig Runs (p-value)": round(runs_pval_o, 4) if runs_pval_o else "N/A",
+            "Rest Runs (p-value)": round(runs_pval_r, 4) if runs_pval_r else "N/A",
+            
+            "Outliers Imputed": out_count,
+            "Orig Shape Profile": shape_desc_o
+        })
+        
+        # JS Payload (binds UI solely to Original model for text)
+        js_data_payload.append({
+            "subj": subj,
+            "loads": clean_list(loads),
+            "raw_y": clean_list(raw_y),
+            "y_clean": clean_list(y_clean),
+            "x_smooth": clean_list(x_smooth),
+            "y_smooth_orig": clean_list(y_smooth_orig),
+            "y_smooth_rest": clean_list(y_smooth_rest),
+            "meas_mfo": safe_float(meas_mfo),
+            "meas_fatmax": safe_float(meas_fatmax),
+            "mfo_o": safe_float(mfo_o),
+            "mfo_bias_o": safe_float(mfo_o - meas_mfo) if mfo_o and meas_mfo else None,
+            "fatmax_o": safe_float(fatmax_o),
+            "zlo_o": safe_float(z_lo_o),
+            "zhi_o": safe_float(z_hi_o),
+            "r2_o": safe_float(r2_o),
+            "runs_p_o": safe_float(runs_pval_o),
+            "outliers": int(out_count),
+            "shape_o": shape_desc_o
+        })
+
+    avg_x = np.linspace(min(loads), max_load, 100)
+    
+    # Calculate Group Averages & SD (for Original model)
+    if group_curves_orig:
+        avg_curve_o = np.mean(group_curves_orig, axis=0)
+        std_curve_o = np.std(group_curves_orig, axis=0)
+        upper_curve_o = avg_curve_o + std_curve_o
+        lower_curve_o = np.maximum(0, avg_curve_o - std_curve_o)
+    else: avg_curve_o = upper_curve_o = lower_curve_o = []
+
+    avg_curve_r = np.mean(group_curves_rest, axis=0) if group_curves_rest else []
+
+    grp_mfo_o = np.max(avg_curve_o) if len(avg_curve_o) > 0 else 0
+    grp_fatmax_o = avg_x[np.argmax(avg_curve_o)] if len(avg_curve_o) > 0 else 0
+    grp_zidx_o = np.where(avg_curve_o >= (grp_mfo_o * 0.90))[0] if len(avg_curve_o) > 0 else []
+    grp_zlo_o = avg_x[grp_zidx_o[0]] if len(grp_zidx_o) > 0 else 0
+    grp_zhi_o = avg_x[grp_zidx_o[-1]] if len(grp_zidx_o) > 0 else 0
+
+    df_res = pd.DataFrame(results)
+    
+    # Calculate CCC between Models
+    ccc_summary = [
+        {"Physiological Metric": "Modeled MFO [g/min]", "CCC (Original vs Resting-In)": calc_ccc(df_res, "Orig Modeled MFO [g/min]", "Rest Modeled MFO [g/min]")},
+        {"Physiological Metric": "Modeled FATmax (Load)", "CCC (Original vs Resting-In)": calc_ccc(df_res, "Orig Modeled FATmax (Load)", "Rest Modeled FATmax (Load)")},
+        {"Physiological Metric": "FATmin (Load)", "CCC (Original vs Resting-In)": calc_ccc(df_res, "Orig FATmin (Load)", "Rest FATmin (Load)")},
+        {"Physiological Metric": "FATmax Zone Low", "CCC (Original vs Resting-In)": calc_ccc(df_res, "Orig FATmax Zone Low", "Rest FATmax Zone Low")},
+        {"Physiological Metric": "FATmax Zone High", "CCC (Original vs Resting-In)": calc_ccc(df_res, "Orig FATmax Zone High", "Rest FATmax Zone High")},
+        {"Physiological Metric": "Translation (b)", "CCC (Original vs Resting-In)": calc_ccc(df_res, "Orig Translation (b)", "Rest Translation (b)")},
+        {"Physiological Metric": "Symmetry (c)", "CCC (Original vs Resting-In)": calc_ccc(df_res, "Orig Symmetry (c)", "Rest Symmetry (c)")},
+        {"Physiological Metric": "R2 (Model Fit)", "CCC (Original vs Resting-In)": calc_ccc(df_res, "Orig R2 (Fit)", "Rest R2 (Fit)")}
+    ]
+    df_ccc = pd.DataFrame(ccc_summary)
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df_res.to_excel(writer, sheet_name="Cohort Summary", index=False)
+        df_ccc.to_excel(writer, sheet_name="Model Concordance (CCC)", index=False)
+        df.to_excel(writer, sheet_name="Raw Input Data", index=False)
+    
+    b64 = base64.b64encode(output.getvalue()).decode()
+    btn_ex = js.document.getElementById("download_excel")
+    btn_ex.href = f"data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}"
+    btn_ex.download = "FATmax_Cohort_Report.xlsx"
+    btn_ex.style.display = "inline-block"
+    btn_ex.classList.remove("disabled")
+
+    if poor_fits:
+        js.document.getElementById("alerts_container").style.display = "block"
+        js.document.getElementById("alert_list").innerText = ", ".join(poor_fits)
+
+    js.renderChartsJSON(
+        json.dumps(js_data_payload), 
+        json.dumps(list(avg_x)), 
+        json.dumps(list(avg_curve_o)), 
+        json.dumps(list(upper_curve_o)),
+        json.dumps(list(lower_curve_o)),
+        json.dumps(list(avg_curve_r)),
+        grp_mfo_o, grp_fatmax_o, grp_zlo_o, grp_zhi_o,
+        load_metric
+    )
+    
+    js.document.getElementById("indiv_title").style.display = "block"
+    js.document.getElementById("loader").style.display = "none"
+
+js.document.getElementById("run_btn").addEventListener("click", create_proxy(process_data))
+</script>
+
+<script>
+    Chart.defaults.locale = 'en-US';
+    
+    const bgPlugin = {
+        id: 'customCanvasBackgroundColor',
+        beforeDraw: (chart, args, options) => {
+            const {ctx} = chart;
+            ctx.save();
+            ctx.globalCompositeOperation = 'destination-over';
+            ctx.fillStyle = options.color || '#ffffff';
+            ctx.fillRect(0, 0, chart.width, chart.height);
+            ctx.restore();
+        }
+    };
+    
+    let chartInstances = [];
+
+    function downloadChart(canvasId, fileName) {
+        const canvas = document.getElementById(canvasId);
+        const link = document.createElement('a');
+        link.download = fileName + '.png';
+        link.href = canvas.toDataURL('image/png', 1.0);
+        link.click();
+    }
+
+    function renderChartsJSON(payloadStr, grpXStr, grpYOrigStr, grpYUpStr, grpYLowStr, grpYRestStr, grpMFO, grpFATmax, grpZlo, grpZhi, xAxisLabel) {
+        chartInstances.forEach(c => c.destroy());
+        chartInstances = [];
+
+        let subjectsData = JSON.parse(payloadStr);
+        let grpX = JSON.parse(grpXStr);
+        let grpYOrig = JSON.parse(grpYOrigStr);
+        let grpYUp = JSON.parse(grpYUpStr);
+        let grpYLow = JSON.parse(grpYLowStr);
+        let grpYRest = JSON.parse(grpYRestStr);
+
+        // 1. Group Chart
+        document.getElementById('group_chart_container').style.display = 'block';
+        const ctxGrp = document.getElementById('groupChart').getContext('2d');
+        
+        let grpChart = new Chart(ctxGrp, {
+            type: 'line',
+            data: {
+                labels: grpX,
+                datasets: [
+                    {
+                        label: '+1 SD', data: grpYUp, borderColor: 'transparent', backgroundColor: 'rgba(214, 51, 132, 0.1)', pointRadius: 0, fill: false, tension: 0.4
+                    },
+                    {
+                        label: '-1 SD', data: grpYLow, borderColor: 'transparent', backgroundColor: 'rgba(214, 51, 132, 0.1)', pointRadius: 0, fill: '-1', tension: 0.4
+                    },
+                    {
+                        label: 'Resting-In Average Model', data: grpYRest, borderColor: '#6f42c1', backgroundColor: 'transparent', borderWidth: 3, borderDash: [6, 4], pointRadius: 0, fill: false, tension: 0.4
+                    },
+                    {
+                        label: 'Original Cheneviere Model', data: grpYOrig, borderColor: '#d63384', backgroundColor: 'transparent', borderWidth: 3, pointRadius: 0, fill: false, tension: 0.4
+                    }
+                ]
+            },
+            options: {
+                responsive: true, maintainAspectRatio: false,
+                scales: {
+                    x: { type: 'linear', title: {display: true, text: xAxisLabel} },
+                    y: { min: 0, title: {display: true, text: 'Fat oxidation (g/min)'} }
+                },
+                plugins: {
+                    legend: { labels: { filter: function(item, chart) { return !item.text.includes('SD'); } } },
+                    annotation: {
+                        annotations: {
+                            box1: { type: 'box', xMin: grpZlo, xMax: grpZhi, backgroundColor: 'rgba(214, 51, 132, 0.15)', borderWidth: 0 },
+                            line1: { type: 'line', xMin: grpFATmax, xMax: grpFATmax, borderColor: '#d63384', borderDash: [5,5], borderWidth: 2, label: { content: 'Group FATmax', display: true, position: 'start' } }
+                        }
+                    },
+                    customCanvasBackgroundColor: { color: 'white' }
+                }
+            },
+            plugins: [bgPlugin]
+        });
+        chartInstances.push(grpChart);
+
+        // 2. Individual Charts
+        const container = document.getElementById('individual_charts_container');
+        subjectsData.forEach((sub, i) => {
+            
+            // Badges bound exclusively to Original Cheneviere Model
+            let isPoor = (sub.runs_p_o !== null && sub.runs_p_o < 0.05);
+            let runsTxt = sub.runs_p_o !== null ? sub.runs_p_o.toFixed(3) : 'N/A';
+            let r2Txt = sub.r2_o !== null ? sub.r2_o.toFixed(2) : 'N/A';
+            let poorFitBadge = isPoor ? `<span class="badge-metric badge-poor">⚠️ Poor Fit (Runs P: ${runsTxt}) | R²: ${r2Txt}</span>` : `<span class="badge-metric">Runs P: ${runsTxt} | R²: ${r2Txt}</span>`;
+            
+            let modPeakTxt = sub.mfo_o !== null ? sub.mfo_o.toFixed(2) : 'N/A';
+            let measPeakTxt = sub.meas_mfo !== null ? sub.meas_mfo.toFixed(2) : 'N/A';
+            let biasColor = (sub.mfo_bias_o !== null && sub.mfo_bias_o > 0) ? '#842029' : '#0f5132';
+            let biasTxt = sub.mfo_bias_o !== null ? ((sub.mfo_bias_o > 0 ? '+' : '') + sub.mfo_bias_o.toFixed(3)) : 'N/A';
+
+            let card = document.createElement('div');
+            card.className = 'chart-card';
+            card.innerHTML = `
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                    <h5 style="color: #0d6efd; margin: 0;">Subject: ${sub.subj}</h5>
+                    <button class="btn btn-sm btn-outline-secondary" onclick="downloadChart('chart_${i}', '${sub.subj}_FATmax_Kinetics')">📸 Save Plot</button>
+                </div>
+                <div style="margin-bottom: 10px;">
+                    ${poorFitBadge}
+                    <span class="badge-metric badge-meas">Meas Peak: ${measPeakTxt}</span>
+                    <span class="badge-metric">Orig Mod Peak: ${modPeakTxt}</span>
+                    <span class="badge-metric" style="color:${biasColor}; font-weight:bold;">Orig Bias: ${biasTxt}</span>
+                </div>
+                <div style="font-size: 0.85em; color: #6c757d; margin-bottom: 10px; padding: 8px; background: #f8f9fa; border-radius: 6px; border: 1px solid #dee2e6;">
+                    <b>Kinetics:</b> ${sub.shape_o} | <b>Imputed:</b> ${sub.outliers}
+                </div>
+                <div style="height: 250px;"><canvas id="chart_${i}"></canvas></div>
+            `;
+            container.appendChild(card);
+
+            const ctx = document.getElementById(`chart_${i}`).getContext('2d');
+            
+            let rawPoints = sub.raw_y.map((v, idx) => v !== null ? {x: sub.loads[idx], y: v} : null).filter(v => v !== null);
+            let imputedPoints = [];
+            for(let j = 0; j < sub.loads.length; j++) {
+                let raw = sub.raw_y[j];
+                let clean = sub.y_clean[j];
+                if (clean !== null && (raw === null || Math.abs(raw - clean) > 0.0001)) {
+                    imputedPoints.push({x: sub.loads[j], y: clean});
+                }
+            }
+
+            let annotations = {};
+            if (sub.fatmax_o !== null) {
+                annotations = {
+                    box1: { type: 'box', xMin: sub.zlo_o, xMax: sub.zhi_o, backgroundColor: 'rgba(13, 110, 253, 0.1)', borderWidth: 0 },
+                    line1: { type: 'line', xMin: sub.fatmax_o, xMax: sub.fatmax_o, borderColor: '#0d6efd', borderDash: [4,4] }
+                };
+            }
+
+            let indivChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: sub.x_smooth,
+                    datasets: [
+                        { label: 'Resting-In Model', data: sub.y_smooth_rest, borderColor: '#6f42c1', borderWidth: 2, pointRadius: 0, tension: 0.4, borderDash: [6, 4] },
+                        { label: 'Original Model', data: sub.y_smooth_orig, borderColor: '#0d6efd', borderWidth: 2, pointRadius: 0, tension: 0.4 },
+                        { label: 'Raw Data', data: rawPoints, backgroundColor: '#adb5bd', borderColor: '#adb5bd', showLine: false, pointRadius: 4 },
+                        { label: 'Imputed', data: imputedPoints, backgroundColor: '#198754', borderColor: '#198754', showLine: false, pointStyle: 'triangle', pointRadius: 6 }
+                    ]
+                },
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    scales: {
+                        x: { type: 'linear', title: {display: true, text: xAxisLabel} },
+                        y: { min: 0, title: {display: true, text: 'Fat oxidation (g/min)'} }
+                    },
+                    plugins: {
+                        legend: { position: 'bottom', labels: { boxWidth: 12 } },
+                        annotation: { annotations: annotations },
+                        customCanvasBackgroundColor: { color: 'white' }
+                    }
+                },
+                plugins: [bgPlugin]
+            });
+            chartInstances.push(indivChart);
+        });
+    }
+</script>
+</body>
+</html>
