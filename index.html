@@ -92,7 +92,7 @@ def safe_float(v):
 def clean_list(lst):
     return [safe_float(x) for x in lst]
 
-# Original Cheneviere Model (Math Constraint 0,0)
+# Original Exponential Sine Model (Math Constraint 0,0)
 def sin_model(x, a, b, c):
     return a * np.sin(np.pi * x / b) * np.exp(-c * x)
 
@@ -146,9 +146,10 @@ def wald_runs_test(y_true, y_pred):
 
 def assess_shape(mfo, fatmax_x, max_load, c):
     amp = "High" if mfo > 0.6 else "Low" if mfo < 0.35 else "Moderate"
-    trans = "Left Shifted (Early)" if (fatmax_x / max_load) < 0.4 else "Right Shifted (Late)" if (fatmax_x / max_load) > 0.6 else "Central"
-    sym = "Right Skewed" if c > 0.05 else "Left Skewed" if c < -0.05 else "Symmetric"
-    return f"Amp: {amp} | Trans: {trans} | Sym: {sym}"
+    pos = "Left Shifted (Early)" if (fatmax_x / max_load) < 0.4 else "Right Shifted (Late)" if (fatmax_x / max_load) > 0.6 else "Central"
+    # Exponential decay behavior: c > 0 pulls peak left, c < 0 pushes peak right
+    sym = "Left Skewed" if c > 0.005 else "Right Skewed" if c < -0.005 else "Symmetric"
+    return f"Amp: {amp} | Pos: {pos} | Sym: {sym}"
 
 def calc_ccc(df, col1, col2):
     s1 = pd.to_numeric(df[col1], errors='coerce')
@@ -218,7 +219,7 @@ async def process_data(event):
 
         x_smooth = np.linspace(min(loads), max_load, 100)
         
-        # --- MODEL 1: ORIGINAL (CHENEVIERE) ---
+        # --- MODEL 1: ORIGINAL EXPONENTIAL SINE ---
         bounds_orig = ([0.1, max_load * 0.5, -2], [2.0, max_load * 3.0, 2])
         p0_orig = [meas_mfo, max_load * 1.5, 0.01]
         
@@ -233,9 +234,9 @@ async def process_data(event):
             z_lo_o = x_smooth[z_idx_o[0]] if len(z_idx_o) > 0 else fatmax_o
             z_hi_o = x_smooth[z_idx_o[-1]] if len(z_idx_o) > 0 else fatmax_o
             
-            try: fmin_o = fsolve(lambda x: sin_model(x, *popt_o), x0=fatmax_o + 1)[0]
-            except: fmin_o = None
-            if fmin_o is not None and (fmin_o < fatmax_o or fmin_o > max_load * 2): fmin_o = None
+            fmin_o = popt_o[1] 
+            if fmin_o < fatmax_o or fmin_o > max_load * 2.5: 
+                fmin_o = None
                 
             y_pred_o = sin_model(fit_loads, *popt_o)
             ss_res_o = np.sum((fit_y - y_pred_o)**2)
@@ -266,9 +267,14 @@ async def process_data(event):
             z_lo_r = x_smooth[z_idx_r[0]] if len(z_idx_r) > 0 else fatmax_r
             z_hi_r = x_smooth[z_idx_r[-1]] if len(z_idx_r) > 0 else fatmax_r
             
-            try: fmin_r = fsolve(lambda x: sin_model_rest(x, *popt_r), x0=fatmax_r + 1)[0]
-            except: fmin_r = None
-            if fmin_r is not None and (fmin_r < fatmax_r or fmin_r > max_load * 2): fmin_r = None
+            try: 
+                fsol, _, ier, _ = fsolve(lambda x: sin_model_rest(x, *popt_r), x0=popt_r[1], full_output=True)
+                fmin_r = fsol[0] if ier == 1 else None
+            except: 
+                fmin_r = None
+            
+            if fmin_r is not None and (fmin_r < fatmax_r or fmin_r > max_load * 2.5): 
+                fmin_r = None
                 
             y_pred_r = sin_model_rest(fit_loads, *popt_r)
             ss_res_r = np.sum((fit_y - y_pred_r)**2)
@@ -302,8 +308,8 @@ async def process_data(event):
             "Orig FATmax Zone High": round(z_hi_o, 2) if z_hi_o else "N/A",
             "Rest FATmax Zone High": round(z_hi_r, 2) if z_hi_r else "N/A",
             
-            "Orig Translation (b)": round(popt_o[1], 3) if popt_o[1] else "N/A",
-            "Rest Translation (b)": round(popt_r[1], 3) if popt_r[1] else "N/A",
+            "Orig Dilatation (b)": round(popt_o[1], 3) if popt_o[1] else "N/A",
+            "Rest Dilatation (b)": round(popt_r[1], 3) if popt_r[1] else "N/A",
             "Orig Symmetry (c)": round(popt_o[2], 3) if popt_o[2] else "N/A",
             "Rest Symmetry (c)": round(popt_r[2], 3) if popt_r[2] else "N/A",
             "Rest Baseline (d)": round(popt_r[3], 3) if popt_r[3] else "N/A",
@@ -317,7 +323,6 @@ async def process_data(event):
             "Orig Shape Profile": shape_desc_o
         })
         
-        # JS Payload (binds UI solely to Original model for text)
         js_data_payload.append({
             "subj": subj,
             "loads": clean_list(loads),
@@ -341,7 +346,6 @@ async def process_data(event):
 
     avg_x = np.linspace(min(loads), max_load, 100)
     
-    # Calculate Group Averages & SD (for Original model)
     if group_curves_orig:
         avg_curve_o = np.mean(group_curves_orig, axis=0)
         std_curve_o = np.std(group_curves_orig, axis=0)
@@ -359,14 +363,13 @@ async def process_data(event):
 
     df_res = pd.DataFrame(results)
     
-    # Calculate CCC between Models
     ccc_summary = [
         {"Physiological Metric": "Modeled MFO [g/min]", "CCC (Original vs Resting-In)": calc_ccc(df_res, "Orig Modeled MFO [g/min]", "Rest Modeled MFO [g/min]")},
         {"Physiological Metric": "Modeled FATmax (Load)", "CCC (Original vs Resting-In)": calc_ccc(df_res, "Orig Modeled FATmax (Load)", "Rest Modeled FATmax (Load)")},
         {"Physiological Metric": "FATmin (Load)", "CCC (Original vs Resting-In)": calc_ccc(df_res, "Orig FATmin (Load)", "Rest FATmin (Load)")},
         {"Physiological Metric": "FATmax Zone Low", "CCC (Original vs Resting-In)": calc_ccc(df_res, "Orig FATmax Zone Low", "Rest FATmax Zone Low")},
         {"Physiological Metric": "FATmax Zone High", "CCC (Original vs Resting-In)": calc_ccc(df_res, "Orig FATmax Zone High", "Rest FATmax Zone High")},
-        {"Physiological Metric": "Translation (b)", "CCC (Original vs Resting-In)": calc_ccc(df_res, "Orig Translation (b)", "Rest Translation (b)")},
+        {"Physiological Metric": "Dilatation (b)", "CCC (Original vs Resting-In)": calc_ccc(df_res, "Orig Dilatation (b)", "Rest Dilatation (b)")},
         {"Physiological Metric": "Symmetry (c)", "CCC (Original vs Resting-In)": calc_ccc(df_res, "Orig Symmetry (c)", "Rest Symmetry (c)")},
         {"Physiological Metric": "R2 (Model Fit)", "CCC (Original vs Resting-In)": calc_ccc(df_res, "Orig R2 (Fit)", "Rest R2 (Fit)")}
     ]
@@ -442,7 +445,6 @@ js.document.getElementById("run_btn").addEventListener("click", create_proxy(pro
         let grpYLow = JSON.parse(grpYLowStr);
         let grpYRest = JSON.parse(grpYRestStr);
 
-        // 1. Group Chart
         document.getElementById('group_chart_container').style.display = 'block';
         const ctxGrp = document.getElementById('groupChart').getContext('2d');
         
@@ -451,18 +453,10 @@ js.document.getElementById("run_btn").addEventListener("click", create_proxy(pro
             data: {
                 labels: grpX,
                 datasets: [
-                    {
-                        label: '+1 SD', data: grpYUp, borderColor: 'transparent', backgroundColor: 'rgba(214, 51, 132, 0.1)', pointRadius: 0, fill: false, tension: 0.4
-                    },
-                    {
-                        label: '-1 SD', data: grpYLow, borderColor: 'transparent', backgroundColor: 'rgba(214, 51, 132, 0.1)', pointRadius: 0, fill: '-1', tension: 0.4
-                    },
-                    {
-                        label: 'Resting-In Average Model', data: grpYRest, borderColor: '#6f42c1', backgroundColor: 'transparent', borderWidth: 3, borderDash: [6, 4], pointRadius: 0, fill: false, tension: 0.4
-                    },
-                    {
-                        label: 'Original Cheneviere Model', data: grpYOrig, borderColor: '#d63384', backgroundColor: 'transparent', borderWidth: 3, pointRadius: 0, fill: false, tension: 0.4
-                    }
+                    { label: '+1 SD', data: grpYUp, borderColor: 'transparent', backgroundColor: 'rgba(214, 51, 132, 0.1)', pointRadius: 0, fill: false, tension: 0.4 },
+                    { label: '-1 SD', data: grpYLow, borderColor: 'transparent', backgroundColor: 'rgba(214, 51, 132, 0.1)', pointRadius: 0, fill: '-1', tension: 0.4 },
+                    { label: 'Resting-In Average Model', data: grpYRest, borderColor: '#6f42c1', backgroundColor: 'transparent', borderWidth: 3, borderDash: [6, 4], pointRadius: 0, fill: false, tension: 0.4 },
+                    { label: 'Original Cheneviere Model', data: grpYOrig, borderColor: '#d63384', backgroundColor: 'transparent', borderWidth: 3, pointRadius: 0, fill: false, tension: 0.4 }
                 ]
             },
             options: {
@@ -486,11 +480,9 @@ js.document.getElementById("run_btn").addEventListener("click", create_proxy(pro
         });
         chartInstances.push(grpChart);
 
-        // 2. Individual Charts
         const container = document.getElementById('individual_charts_container');
         subjectsData.forEach((sub, i) => {
             
-            // Badges bound exclusively to Original Cheneviere Model
             let isPoor = (sub.runs_p_o !== null && sub.runs_p_o < 0.05);
             let runsTxt = sub.runs_p_o !== null ? sub.runs_p_o.toFixed(3) : 'N/A';
             let r2Txt = sub.r2_o !== null ? sub.r2_o.toFixed(2) : 'N/A';
